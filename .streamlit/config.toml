@@ -1,0 +1,14 @@
+[theme]
+primaryColor = "#F39C12"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F7F7F7"
+textColor = "#333333"
+font = "sans serif"
+
+[server]
+enableCORS = false
+port = 8501
+
+[global]
+# Set the default layout for the app
+layout = "centered"

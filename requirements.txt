@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+matplotlib
+jsonschema
+streamlit-option-menu
+streamlit-plotly-events
+openpyxl
+gspread
+google-auth
