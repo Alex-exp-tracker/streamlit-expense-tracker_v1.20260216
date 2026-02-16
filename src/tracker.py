@@ -11,6 +11,8 @@ Responsibilities:
 """
 
 from typing import List, Dict, Optional, Tuple
+import sys
+import tempfile
 from src.models import Expense
 import json
 import os
@@ -29,10 +31,36 @@ except Exception:
     Credentials = None
 
 # location of the JSON persistence file (relative to src/)
-DATA_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "expenses_data.json")
+_default_data_file = os.path.join(os.path.dirname(__file__), "..", "data", "expenses_data.json")
+# When running under pytest, use a temp file to avoid reading/writing the project's
+# real data file and to keep tests isolated from user data.
+if any("pytest" in p for p in sys.argv) or os.getenv("PYTEST_CURRENT_TEST"):
+    DATA_FILE = os.path.join(tempfile.gettempdir(), "tmp_expenses_test.json")
+else:
+    DATA_FILE = _default_data_file
 
 # default categories shown when the data file has no categories saved yet
-DEFAULT_CATEGORIES = ["Groceries", "MiniM", "Electricity & Water", "Eating out"]
+DEFAULT_CATEGORIES = [
+    "Groceries",
+    "MiniM",
+    "Electricity & Water",
+    "Eating out",
+    "Fuel",
+    "Home",
+    "Electronics",
+    "Telephony",
+    "Taxes",
+    "PPE",
+    "Culture & Entertainment",
+    "Transport",
+    "Gifts",
+    "Clothes",
+    "Airfares",
+    "Hotels - Holidays",
+    "Fuel - Holidays",
+    "Culture & Entertainment - Hol.",
+    "Transport - Holidays",
+]
 
 # ensure a logger is available
 logger = logging.getLogger(__name__)
@@ -59,6 +87,14 @@ class ExpenseTracker:
         # load persisted state (if any)
         # initialize Google Sheets backend (if configured)
         self._gs_backend = GoogleSheetsBackend() if "GoogleSheetsBackend" in globals() else None
+        # When running tests, ensure we start from a clean state by removing
+        # any temp data file left from previous test runs.
+        if any("pytest" in p for p in sys.argv) or os.getenv("PYTEST_CURRENT_TEST"):
+            try:
+                if os.path.exists(DATA_FILE):
+                    os.remove(DATA_FILE)
+            except Exception:
+                pass
         self.load()
 
     def add_expense(
@@ -224,8 +260,18 @@ class ExpenseTracker:
             exp.id = idx
         # set next id to len + 1 (so next add continues sequence)
         self._next_id = int(data.get("next_id", len(self.expenses) + 1))
-        # restore categories (keep defaults if missing)
-        self.categories = data.get("categories", []) or list(DEFAULT_CATEGORIES)
+        # restore categories: ensure DEFAULT_CATEGORIES are present (prepend defaults)
+        loaded_cats = data.get("categories", []) or []
+        merged = []
+        for c in DEFAULT_CATEGORIES:
+            if c in loaded_cats:
+                merged.append(c)
+        # append any other loaded categories preserving their order
+        for c in loaded_cats:
+            if c not in merged:
+                merged.append(c)
+        # if no categories were loaded, fall back to defaults
+        self.categories = merged or list(DEFAULT_CATEGORIES)
 
     def balances(self) -> Dict[str, Dict[str, float]]:
         """
