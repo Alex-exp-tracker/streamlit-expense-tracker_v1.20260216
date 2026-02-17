@@ -15,7 +15,7 @@ The form enforces validation rules:
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Callable
+from typing import Dict, List, Callable, Optional, Any
 from src.models import Expense
 from src.tracker import DEFAULT_CATEGORIES
 import datetime
@@ -61,6 +61,30 @@ class ExpenseInput:
     unit: str
     shares: Dict[str, float]
     date: str  # ISO date string
+
+
+def _show_grand_total_chf(
+    grand_total_chf: Optional[float],
+    fx_snapshot: Optional[Dict[str, Any]] = None,
+):
+    if grand_total_chf is None:
+        return
+    st.markdown(f"**Grand Total: {grand_total_chf:.2f} CHF**")
+    if fx_snapshot:
+        source = str(fx_snapshot.get("source", "FX provider"))
+        as_of = str(fx_snapshot.get("as_of", "") or "")
+        stale = bool(fx_snapshot.get("stale", False))
+        if as_of:
+            st.caption(f"Converted using {source} rates as of {as_of}" + (" (stale cache)" if stale else ""))
+        else:
+            st.caption(f"Converted using {source}" + (" (stale cache)" if stale else ""))
+
+
+def _show_skipped_units(skipped_units: Optional[Dict[str, float]] = None):
+    if not skipped_units:
+        return
+    parts = [f"{unit}: {amount:.2f}" for unit, amount in sorted(skipped_units.items())]
+    st.caption("Excluded from CHF conversion (missing rate): " + ", ".join(parts))
 
 
 def display_expense_form(on_submit: Callable[[ExpenseInput], None],
@@ -181,7 +205,12 @@ def display_expense_form(on_submit: Callable[[ExpenseInput], None],
             st.success("Expense added.")
 
 
-def display_expense_list(expenses: List[Expense]):
+def display_expense_list(
+    expenses: List[Expense],
+    grand_total_chf: Optional[float] = None,
+    fx_snapshot: Optional[Dict[str, Any]] = None,
+    skipped_units: Optional[Dict[str, float]] = None,
+):
     """
     Render expenses as an interactive table and provide an XLSX export button.
 
@@ -195,6 +224,8 @@ def display_expense_list(expenses: List[Expense]):
     if not expenses:
         st.write("No expenses recorded.")
         return
+    _show_grand_total_chf(grand_total_chf, fx_snapshot=fx_snapshot)
+    _show_skipped_units(skipped_units)
 
     # Build DataFrame from expenses
     rows = []
@@ -244,9 +275,16 @@ def display_expense_list(expenses: List[Expense]):
     )
 
 
-def display_balances(balances_by_unit: Dict[str, Dict[str, float]]):
+def display_balances(
+    balances_by_unit: Dict[str, Dict[str, float]],
+    grand_total_chf: Optional[float] = None,
+    fx_snapshot: Optional[Dict[str, Any]] = None,
+    skipped_units: Optional[Dict[str, float]] = None,
+):
     """Show balances grouped per currency unit."""
     st.header("Balances")
+    _show_grand_total_chf(grand_total_chf, fx_snapshot=fx_snapshot)
+    _show_skipped_units(skipped_units)
     if balances_by_unit:
         for unit, balances in balances_by_unit.items():
             st.markdown(f"**{unit}**")
@@ -258,30 +296,46 @@ def display_balances(balances_by_unit: Dict[str, Dict[str, float]]):
     else:
         st.write("No balances to display.")
 
-def display_expenses_over_time(expenses: List[Expense]):
-    """Show stacked monthly bars of expenses per currency, color-coded by category.
+def display_expenses_over_time(
+    expenses: List[Expense],
+    chf_rates: Optional[Dict[str, float]] = None,
+    grand_total_chf: Optional[float] = None,
+    fx_snapshot: Optional[Dict[str, Any]] = None,
+    skipped_units: Optional[Dict[str, float]] = None,
+):
+    """Show stacked monthly bars of expenses over time.
 
-    Input: list of `Expense` objects. The chart groups expenses by month (X axis)
-    and category (stacked segments), producing one chart per currency/unit.
+    When chf_rates is provided, amounts are converted and aggregated in CHF only.
     """
     st.header("Expenses over time")
     if not expenses:
         st.write("No expenses recorded.")
         return
+    _show_grand_total_chf(grand_total_chf, fx_snapshot=fx_snapshot)
+    _show_skipped_units(skipped_units)
 
-    # Build DataFrame with a month-start datetime column
+    # Build DataFrame with a month-start datetime column.
     rows = []
     for e in expenses:
         try:
             dt = pd.to_datetime(getattr(e, "date", ""), errors="coerce")
         except Exception:
             dt = pd.NaT
+        unit = str(getattr(e, "unit", "EUR") or "EUR").upper()
+        amount = float(getattr(e, "amount", 0.0))
+        if chf_rates is not None:
+            rate = chf_rates.get(unit)
+            if rate is None:
+                continue
+            amount = amount * float(rate)
+            unit = "CHF"
+
         rows.append({
             "date": dt,
             "month": pd.Period(dt, freq="M").to_timestamp() if not pd.isna(dt) else pd.NaT,
             "category": getattr(e, "category", ""),
-            "amount": float(getattr(e, "amount", 0.0)),
-            "unit": getattr(e, "unit", "EUR") or "EUR",
+            "amount": amount,
+            "unit": unit,
         })
 
     df = pd.DataFrame(rows)
@@ -291,8 +345,9 @@ def display_expenses_over_time(expenses: List[Expense]):
         st.info("No dated expenses to chart.")
         return
 
-    # Aggregate by unit, month, category
-    agg = df.groupby(["unit", "month", "category"])["amount"].sum().reset_index()
+    # Aggregate by month, category (and unit when not converted)
+    group_cols = ["month", "category"] if chf_rates is not None else ["unit", "month", "category"]
+    agg = df.groupby(group_cols)["amount"].sum().reset_index()
 
     # Determine global category ordering (use DEFAULT_CATEGORIES first)
     all_cats = sorted(agg["category"].unique())
@@ -312,7 +367,21 @@ def display_expenses_over_time(expenses: List[Expense]):
 
     color_scale = alt.Scale(domain=ordered, range=colors)
 
-    # Render one chart per currency/unit
+    if chf_rates is not None:
+        chart = alt.Chart(agg).mark_bar().encode(
+            x=alt.X("month:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
+            y=alt.Y("amount:Q", title="Amount (CHF)"),
+            color=alt.Color("category:N", scale=color_scale, sort=ordered, legend=alt.Legend(title="Category")),
+            tooltip=[
+                alt.Tooltip("month:T", title="Month", format="%Y-%m"),
+                alt.Tooltip("category:N", title="Category"),
+                alt.Tooltip("amount:Q", title="Amount (CHF)", format=".2f"),
+            ],
+        ).properties(width="container", height=300)
+        st.altair_chart(chart, use_container_width=True)
+        return
+
+    # Render one chart per currency/unit when no CHF conversion is requested.
     units = sorted(agg["unit"].unique())
     for unit in units:
         sub = agg[agg["unit"] == unit].copy()
@@ -323,10 +392,12 @@ def display_expenses_over_time(expenses: List[Expense]):
             x=alt.X("month:T", title="Month", axis=alt.Axis(format="%Y-%m", labelAngle=-45)),
             y=alt.Y("amount:Q", title=f"Amount ({unit})"),
             color=alt.Color("category:N", scale=color_scale, sort=ordered, legend=alt.Legend(title="Category")),
-            tooltip=[alt.Tooltip("month:T", title="Month", format="%Y-%m"), alt.Tooltip("category:N", title="Category"), alt.Tooltip("amount:Q", title="Amount", format=".2f")]
+            tooltip=[
+                alt.Tooltip("month:T", title="Month", format="%Y-%m"),
+                alt.Tooltip("category:N", title="Category"),
+                alt.Tooltip("amount:Q", title="Amount", format=".2f"),
+            ],
         ).properties(width="container", height=300)
-
-        # Use stacking (default for bar with color) and show chart
         st.altair_chart(chart, use_container_width=True)
 
 def display_settle_suggestions(suggestions_by_unit: Dict[str, List[str]]):
@@ -342,6 +413,23 @@ def display_settle_suggestions(suggestions_by_unit: Dict[str, List[str]]):
                 st.write(f"  {s}")
     else:
         st.write("No settle suggestions available.")
+
+
+def display_settle_suggestions_chf(
+    suggestions: List[str],
+    grand_total_chf: Optional[float] = None,
+    fx_snapshot: Optional[Dict[str, Any]] = None,
+    skipped_units: Optional[Dict[str, float]] = None,
+):
+    """Show settle-up suggestions in CHF only."""
+    st.header("Settle Suggestions (CHF)")
+    _show_grand_total_chf(grand_total_chf, fx_snapshot=fx_snapshot)
+    _show_skipped_units(skipped_units)
+    if suggestions:
+        for s in suggestions:
+            st.write(f"  {s}")
+    else:
+        st.write("Nothing to settle.")
 
 
 def display_category_totals(totals_by_unit: Dict[str, Dict[str, float]]):
@@ -425,6 +513,68 @@ def display_category_totals(totals_by_unit: Dict[str, Dict[str, float]]):
 
         # Render chart without in-chart text labels (percentages shown in the textual list above)
         st.altair_chart(pie, use_container_width=True)
+
+
+def display_category_totals_chf(
+    totals_chf: Dict[str, float],
+    grand_total_chf: Optional[float] = None,
+    fx_snapshot: Optional[Dict[str, Any]] = None,
+    skipped_units: Optional[Dict[str, float]] = None,
+):
+    """Show totals per category in CHF only, with a pie chart."""
+    st.header("Totals per Category (CHF)")
+    _show_grand_total_chf(grand_total_chf, fx_snapshot=fx_snapshot)
+    _show_skipped_units(skipped_units)
+    if not totals_chf:
+        st.write("No totals to display.")
+        return
+
+    total_amount = float(sum(totals_chf.values()))
+    st.write(f"Total: {total_amount:.2f} CHF")
+    rows = []
+    for cat, amt in totals_chf.items():
+        amt_f = float(amt)
+        pct = (amt_f / total_amount * 100) if total_amount > 0 else 0.0
+        st.write(f"  {cat}: {amt_f:.2f} CHF ({pct:.1f}%)")
+        rows.append({"category": cat, "amount": amt_f, "percent": pct})
+
+    df = pd.DataFrame(rows)
+    if df["amount"].sum() <= 0:
+        st.info("No positive amounts to chart.")
+        return
+
+    # Stable category ordering and color mapping.
+    all_cats = sorted(df["category"].unique())
+    ordered = [c for c in DEFAULT_CATEGORIES if c in all_cats]
+    ordered += [c for c in all_cats if c not in ordered]
+
+    PALETTE = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
+    ]
+    if len(PALETTE) < len(ordered):
+        times = (len(ordered) + len(PALETTE) - 1) // len(PALETTE)
+        colors = (PALETTE * times)[: len(ordered)]
+    else:
+        colors = PALETTE[: len(ordered)]
+    color_scale = alt.Scale(domain=ordered, range=colors)
+
+    pie = alt.Chart(df).mark_arc(innerRadius=50).encode(
+        theta=alt.Theta(field="amount", type="quantitative"),
+        color=alt.Color(
+            field="category",
+            type="nominal",
+            scale=color_scale,
+            legend=alt.Legend(title="Category"),
+            sort=ordered,
+        ),
+        tooltip=[
+            alt.Tooltip("category:N", title="Category"),
+            alt.Tooltip("amount:Q", title="Amount (CHF)", format=".2f"),
+            alt.Tooltip("percent:Q", title="Share", format=".1f"),
+        ],
+    ).properties(title="Category share (CHF)")
+    st.altair_chart(pie, use_container_width=True)
 
 
 def display_manage_expenses(tracker):

@@ -36,3 +36,17 @@ The app writes to two worksheets in the target spreadsheet:
 - Cell writes use Google Sheets `RAW` mode, so user input is stored as plain data (not executed as formulas).
 
 A template is included at `.streamlit/secrets.toml.example`.
+
+## Live FX conversion to CHF
+
+The app fetches live rates from Frankfurter (ECB reference rates) and converts EUR/USD to CHF for:
+
+- Grand Total (CHF) in `List Expenses`, `Show Balances`, `Show Settle Suggestions`, `Category Totals`, `Expenses over time`
+- CHF-only views for `Show Settle Suggestions`, `Category Totals`, and `Expenses over time`
+
+Optional environment settings:
+
+- `FX_API_URL` (default: `https://api.frankfurter.app/latest?from=EUR&to=CHF,USD`)
+- `FX_CACHE_TTL_SECONDS` (default: `3600`)
+
+If live rates cannot be fetched, the app uses the last cached rates when available.

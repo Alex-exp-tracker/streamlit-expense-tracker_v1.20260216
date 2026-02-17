@@ -54,6 +54,8 @@ def main():
     """
     st.title("Expense Tracker Dashboard")
     tracker = ExpenseTracker()
+    fx_snapshot = tracker.get_fx_snapshot()
+    fx_rates = fx_snapshot.get("rates", {"CHF": 1.0})
     backend_name, backend_msg = tracker.storage_status()
     if backend_name == "google_sheets":
         st.sidebar.success(backend_msg)
@@ -63,6 +65,17 @@ def main():
             "For indefinite cloud persistence, set GOOGLE_SHEET_ID and "
             "GOOGLE_SERVICE_ACCOUNT_JSON in Streamlit app Secrets."
         )
+    if fx_snapshot.get("error"):
+        st.sidebar.warning(fx_snapshot.get("error"))
+    else:
+        as_of = fx_snapshot.get("as_of", "")
+        source = fx_snapshot.get("source", "FX provider")
+        if as_of:
+            st.sidebar.caption(f"{source} rates as of {as_of}")
+        else:
+            st.sidebar.caption(f"{source} rates loaded")
+    if fx_snapshot.get("stale"):
+        st.sidebar.caption("FX rates may be stale.")
 
     menu = ["Add Expense", "List Expenses", "Show Balances", "Show Settle Suggestions", "Category Totals", "Expenses over time", "Edit Expense", "Clear All Expenses"]
     choice = st.sidebar.selectbox("Select an option", menu)
@@ -99,15 +112,35 @@ def main():
             expenses = tracker.list_expenses()
         else:
             expenses = tracker.list_expenses(year=year_sel, month=month_sel)
-        display_expenses(expenses)
+        grand_total_chf, skipped_units = tracker.grand_total_chf(expenses=expenses, rates=fx_rates)
+        components.display_expense_list(
+            expenses,
+            grand_total_chf=grand_total_chf,
+            fx_snapshot=fx_snapshot,
+            skipped_units=skipped_units,
+        )
 
     elif choice == "Show Balances":
         balances_by_unit = tracker.balances()
-        display_balances(balances_by_unit)
+        all_expenses = tracker.list_expenses()
+        grand_total_chf, skipped_units = tracker.grand_total_chf(expenses=all_expenses, rates=fx_rates)
+        components.display_balances(
+            balances_by_unit,
+            grand_total_chf=grand_total_chf,
+            fx_snapshot=fx_snapshot,
+            skipped_units=skipped_units,
+        )
 
     elif choice == "Show Settle Suggestions":
-        suggestions_by_unit = tracker.settle_suggestions()
-        display_settle_suggestions(suggestions_by_unit)
+        all_expenses = tracker.list_expenses()
+        suggestions_chf = tracker.settle_suggestions_chf(rates=fx_rates)
+        grand_total_chf, skipped_units = tracker.grand_total_chf(expenses=all_expenses, rates=fx_rates)
+        components.display_settle_suggestions_chf(
+            suggestions_chf,
+            grand_total_chf=grand_total_chf,
+            fx_snapshot=fx_snapshot,
+            skipped_units=skipped_units,
+        )
 
     elif choice == "Category Totals":
         # allow the user to aggregate totals for a month or a whole year
@@ -124,15 +157,32 @@ def main():
                     st.info("No months for selected year.")
                 else:
                     month_sel = st.selectbox("Month", options=month_options, index=0)
-                    totals = tracker.totals_by_month(year_sel, month_sel)
-                    display_category_totals(totals)
+                    totals_chf, skipped_units = tracker.totals_by_month_chf(year_sel, month_sel, rates=fx_rates)
+                    components.display_category_totals_chf(
+                        totals_chf,
+                        grand_total_chf=round(sum(totals_chf.values()), 2),
+                        fx_snapshot=fx_snapshot,
+                        skipped_units=skipped_units,
+                    )
             else:
-                totals = tracker.totals_by_year(year_sel)
-                display_category_totals(totals)
+                totals_chf, skipped_units = tracker.totals_by_year_chf(year_sel, rates=fx_rates)
+                components.display_category_totals_chf(
+                    totals_chf,
+                    grand_total_chf=round(sum(totals_chf.values()), 2),
+                    fx_snapshot=fx_snapshot,
+                    skipped_units=skipped_units,
+                )
 
     elif choice == "Expenses over time":
         exs = tracker.list_expenses()
-        components.display_expenses_over_time(exs)
+        grand_total_chf, skipped_units = tracker.grand_total_chf(expenses=exs, rates=fx_rates)
+        components.display_expenses_over_time(
+            exs,
+            chf_rates=fx_rates,
+            grand_total_chf=grand_total_chf,
+            fx_snapshot=fx_snapshot,
+            skipped_units=skipped_units,
+        )
 
     elif choice == "Edit Expense":
         # New: show edit/delete UI

@@ -21,6 +21,8 @@ import ast
 import tempfile
 import shutil
 import logging
+import time
+import urllib.request
 
 # Optional Google Sheets backend imports are lazy/optional; we try to use them
 try:
@@ -69,6 +71,76 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
+
+FX_API_URL = os.getenv("FX_API_URL", "https://api.frankfurter.app/latest?from=EUR&to=CHF,USD")
+FX_CACHE_TTL_SECONDS = int(os.getenv("FX_CACHE_TTL_SECONDS", "3600"))
+
+
+class FXRateService:
+    """
+    Lightweight FX service with in-process TTL caching.
+
+    Rates are normalized to CHF conversion factors:
+      - CHF -> CHF = 1.0
+      - EUR -> CHF = x
+      - USD -> CHF = y
+    """
+
+    _cache: Optional[Dict[str, Any]] = None
+    _cached_at: float = 0.0
+
+    @classmethod
+    def get_snapshot(cls, force_refresh: bool = False) -> Dict[str, Any]:
+        now = time.time()
+        if (
+            not force_refresh
+            and cls._cache is not None
+            and (now - cls._cached_at) < FX_CACHE_TTL_SECONDS
+        ):
+            return dict(cls._cache)
+
+        try:
+            req = urllib.request.Request(
+                FX_API_URL,
+                headers={"User-Agent": "streamlit-expense-tracker/1.0"},
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+
+            raw_rates = payload.get("rates", {}) or {}
+            chf_per_eur = float(raw_rates["CHF"])
+            usd_per_eur = float(raw_rates["USD"])
+            if chf_per_eur <= 0 or usd_per_eur <= 0:
+                raise ValueError("Invalid FX rates from provider")
+
+            snapshot = {
+                "rates": {
+                    "CHF": 1.0,
+                    "EUR": chf_per_eur,
+                    "USD": chf_per_eur / usd_per_eur,
+                },
+                "as_of": str(payload.get("date", "") or ""),
+                "source": "Frankfurter (ECB)",
+                "stale": False,
+                "error": "",
+            }
+            cls._cache = snapshot
+            cls._cached_at = now
+            return dict(snapshot)
+        except Exception as exc:
+            if cls._cache is not None:
+                stale = dict(cls._cache)
+                stale["stale"] = True
+                stale["error"] = f"Live FX refresh failed ({exc.__class__.__name__}); using last cached rates."
+                return stale
+            return {
+                "rates": {"CHF": 1.0},
+                "as_of": "",
+                "source": "Frankfurter (ECB)",
+                "stale": True,
+                "error": f"Live FX lookup failed ({exc.__class__.__name__}); only CHF values can be converted.",
+            }
 
 
 class GoogleSheetsBackend:
@@ -399,6 +471,159 @@ class ExpenseTracker:
             return "google_sheets", "Persistent storage active (Google Sheets)."
         reason = getattr(self._gs_backend, "reason", "Google Sheets not configured")
         return "local_json", f"Using local file fallback: {reason}."
+
+    def get_fx_snapshot(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """
+        Return CHF conversion snapshot from the configured FX provider.
+        """
+        return FXRateService.get_snapshot(force_refresh=force_refresh)
+
+    @staticmethod
+    def _normalize_unit(unit: str) -> str:
+        return str(unit or "").strip().upper()
+
+    def amount_to_chf(self, amount: float, unit: str, rates: Dict[str, float]) -> Optional[float]:
+        """
+        Convert amount from a unit into CHF.
+        Returns None when no conversion rate is available.
+        """
+        unit_norm = self._normalize_unit(unit)
+        if unit_norm not in rates:
+            return None
+        try:
+            return float(amount) * float(rates[unit_norm])
+        except Exception:
+            return None
+
+    def grand_total_chf(
+        self,
+        expenses: Optional[List[Expense]] = None,
+        rates: Optional[Dict[str, float]] = None,
+    ) -> Tuple[float, Dict[str, float]]:
+        """
+        Convert expenses to CHF and sum them into a grand total.
+        Returns (grand_total_chf, skipped_amounts_by_unit).
+        """
+        if expenses is None:
+            expenses = self.list_expenses()
+        if rates is None:
+            rates = self.get_fx_snapshot().get("rates", {"CHF": 1.0})
+
+        total = 0.0
+        skipped: Dict[str, float] = {}
+        for e in expenses:
+            unit = self._normalize_unit(getattr(e, "unit", "CHF"))
+            try:
+                amount = float(getattr(e, "amount", 0.0))
+            except Exception:
+                continue
+            amount_chf = self.amount_to_chf(amount, unit, rates)
+            if amount_chf is None:
+                skipped[unit] = round(skipped.get(unit, 0.0) + amount, 2)
+                continue
+            total += amount_chf
+
+        return round(total, 2), skipped
+
+    def balances_chf(self, rates: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+        """
+        Combine per-currency balances into a single CHF balance per participant.
+        Unsupported currencies are ignored.
+        """
+        if rates is None:
+            rates = self.get_fx_snapshot().get("rates", {"CHF": 1.0})
+
+        balances_by_unit = self.balances()
+        out: Dict[str, float] = {}
+        for unit, unit_balances in balances_by_unit.items():
+            unit_norm = self._normalize_unit(unit)
+            rate = rates.get(unit_norm)
+            if rate is None:
+                continue
+            for name, amount in unit_balances.items():
+                out[name] = out.get(name, 0.0) + (float(amount) * float(rate))
+
+        # round and normalize tiny residuals
+        for name, value in list(out.items()):
+            if abs(value) < 0.005:
+                out[name] = 0.0
+            else:
+                out[name] = round(value, 2)
+        return out
+
+    def settle_suggestions_chf(self, rates: Optional[Dict[str, float]] = None) -> List[str]:
+        """
+        Produce settle-up suggestions on combined CHF balances.
+        """
+        balances = self.balances_chf(rates=rates)
+        creditors = [(p, amt) for p, amt in balances.items() if amt > 0]
+        debtors = [(p, -amt) for p, amt in balances.items() if amt < 0]
+        creditors.sort(key=lambda x: x[1], reverse=True)
+        debtors.sort(key=lambda x: x[1], reverse=True)
+
+        i = j = 0
+        suggestions: List[str] = []
+        while i < len(debtors) and j < len(creditors):
+            d_name, d_amt = debtors[i]
+            c_name, c_amt = creditors[j]
+            pay = round(min(d_amt, c_amt), 2)
+            suggestions.append(f"{d_name} pays {c_name} {pay:.2f} CHF")
+            d_amt -= pay
+            c_amt -= pay
+            if d_amt <= 0.005:
+                i += 1
+            else:
+                debtors[i] = (d_name, d_amt)
+            if c_amt <= 0.005:
+                j += 1
+            else:
+                creditors[j] = (c_name, c_amt)
+        return suggestions
+
+    def category_totals_chf(
+        self,
+        expenses: List[Expense],
+        rates: Optional[Dict[str, float]] = None,
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """
+        Aggregate category totals into CHF for a given expense subset.
+        Returns (category_totals_chf, skipped_amounts_by_unit).
+        """
+        if rates is None:
+            rates = self.get_fx_snapshot().get("rates", {"CHF": 1.0})
+
+        totals: Dict[str, float] = {}
+        skipped: Dict[str, float] = {}
+        for e in expenses:
+            unit = self._normalize_unit(getattr(e, "unit", "CHF"))
+            try:
+                amount = float(getattr(e, "amount", 0.0))
+            except Exception:
+                continue
+            category = str(getattr(e, "category", "") or "")
+            amount_chf = self.amount_to_chf(amount, unit, rates)
+            if amount_chf is None:
+                skipped[unit] = round(skipped.get(unit, 0.0) + amount, 2)
+                continue
+            totals[category] = round(totals.get(category, 0.0) + amount_chf, 2)
+        return totals, skipped
+
+    def totals_by_month_chf(
+        self,
+        year: int,
+        month: int,
+        rates: Optional[Dict[str, float]] = None,
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        expenses = self.list_expenses(year=year, month=month)
+        return self.category_totals_chf(expenses, rates=rates)
+
+    def totals_by_year_chf(
+        self,
+        year: int,
+        rates: Optional[Dict[str, float]] = None,
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        expenses = self.list_expenses(year=year)
+        return self.category_totals_chf(expenses, rates=rates)
 
     def add_expense(
         self,
