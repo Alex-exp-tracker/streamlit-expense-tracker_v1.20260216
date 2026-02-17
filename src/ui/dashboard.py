@@ -54,6 +54,15 @@ def main():
     """
     st.title("Expense Tracker Dashboard")
     tracker = ExpenseTracker()
+    backend_name, backend_msg = tracker.storage_status()
+    if backend_name == "google_sheets":
+        st.sidebar.success(backend_msg)
+    else:
+        st.sidebar.warning(backend_msg)
+        st.sidebar.caption(
+            "For indefinite cloud persistence, set GOOGLE_SHEET_ID and "
+            "GOOGLE_SERVICE_ACCOUNT_JSON in Streamlit app Secrets."
+        )
 
     menu = ["Add Expense", "List Expenses", "Show Balances", "Show Settle Suggestions", "Category Totals", "Expenses over time", "Edit Expense", "Clear All Expenses"]
     choice = st.sidebar.selectbox("Select an option", menu)

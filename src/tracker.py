@@ -3,21 +3,21 @@ tracker.py - core application logic and persistence
 
 Responsibilities:
  - keep an in-memory list of Expense objects
- - persist/load data to data/expenses_data.json (expenses, categories, next_id)
+ - persist/load data to Google Sheets (preferred) or local JSON fallback
  - provide helper APIs consumed by the UI:
      add_expense, list_expenses(filter by year/month),
      balances (grouped by currency), settle_suggestions (per currency),
      totals_by_month/year, category management
 """
 
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 import sys
-import tempfile
 from src.models import Expense
 import json
 import os
 import datetime
 from collections import defaultdict
+import ast
 import tempfile
 import shutil
 import logging
@@ -71,6 +71,297 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
+class GoogleSheetsBackend:
+    """
+    Google Sheets persistence backend.
+
+    Data layout:
+      - worksheet "expenses": tabular rows of expenses
+      - worksheet "meta": key/value metadata (next_id, categories)
+    """
+
+    EXPENSES_SHEET_NAME = "expenses"
+    META_SHEET_NAME = "meta"
+    EXPENSE_HEADERS = [
+        "id",
+        "amount",
+        "payer",
+        "participants",
+        "category",
+        "description",
+        "unit",
+        "shares_json",
+        "date",
+    ]
+    META_HEADERS = ["key", "value"]
+    SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+    def __init__(self):
+        self.available = False
+        self.reason = ""
+        self.sheet_id = (os.getenv("GOOGLE_SHEET_ID") or "").strip()
+        self._spreadsheet = None
+        self._expenses_ws = None
+        self._meta_ws = None
+
+        if not self.sheet_id:
+            self.reason = "GOOGLE_SHEET_ID is not set"
+            return
+        if gspread is None or Credentials is None:
+            self.reason = "Google Sheets dependencies are unavailable"
+            return
+
+        try:
+            creds = self._build_credentials()
+            client = gspread.authorize(creds)
+            self._spreadsheet = client.open_by_key(self.sheet_id)
+            self._expenses_ws = self._get_or_create_worksheet(
+                self.EXPENSES_SHEET_NAME, rows=1000, cols=max(12, len(self.EXPENSE_HEADERS))
+            )
+            self._meta_ws = self._get_or_create_worksheet(self.META_SHEET_NAME, rows=200, cols=4)
+            self._ensure_headers()
+            self.available = True
+        except Exception as exc:
+            self.available = False
+            self.reason = f"Google Sheets init failed ({exc.__class__.__name__})"
+            logger.warning("Google Sheets backend unavailable: %s", self.reason)
+
+    def _build_credentials(self):
+        service_account_json = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
+        service_account_file = (os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE") or "").strip()
+
+        if service_account_json:
+            try:
+                info = json.loads(service_account_json)
+            except Exception:
+                # tolerate Python-dict style strings often used by mistake in env vars
+                info = ast.literal_eval(service_account_json)
+            if not isinstance(info, dict):
+                raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON must decode to an object")
+            return Credentials.from_service_account_info(info, scopes=self.SCOPES)
+
+        if service_account_file:
+            return Credentials.from_service_account_file(service_account_file, scopes=self.SCOPES)
+
+        # Fallback to application default credentials if available.
+        import google.auth
+        creds, _ = google.auth.default(scopes=self.SCOPES)
+        return creds
+
+    def _get_or_create_worksheet(self, title: str, rows: int, cols: int):
+        try:
+            return self._spreadsheet.worksheet(title)
+        except Exception:
+            return self._spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
+
+    @staticmethod
+    def _ensure_sheet_size(ws, min_rows: int, min_cols: int):
+        new_rows = max(ws.row_count, min_rows)
+        new_cols = max(ws.col_count, min_cols)
+        if new_rows != ws.row_count or new_cols != ws.col_count:
+            ws.resize(rows=new_rows, cols=new_cols)
+
+    def _ensure_headers(self):
+        # Keep headers explicit so sheet is always readable and Excel-like.
+        if self._expenses_ws:
+            first = self._expenses_ws.row_values(1) or []
+            if [x.strip() for x in first] != self.EXPENSE_HEADERS:
+                self._ensure_sheet_size(self._expenses_ws, 2, len(self.EXPENSE_HEADERS))
+                self._expenses_ws.update(
+                    range_name="A1",
+                    values=[self.EXPENSE_HEADERS],
+                    value_input_option="RAW",
+                )
+        if self._meta_ws:
+            first = self._meta_ws.row_values(1) or []
+            if [x.strip() for x in first] != self.META_HEADERS:
+                self._ensure_sheet_size(self._meta_ws, 2, len(self.META_HEADERS))
+                self._meta_ws.update(
+                    range_name="A1",
+                    values=[self.META_HEADERS],
+                    value_input_option="RAW",
+                )
+
+    @staticmethod
+    def _to_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(float(str(value).strip()))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(str(value).strip())
+        except Exception:
+            return default
+
+    @staticmethod
+    def _parse_json_or_literal(value: Any):
+        if isinstance(value, (list, dict)):
+            return value
+        text = str(value or "").strip()
+        if not text:
+            return None
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                return parser(text)
+            except Exception:
+                continue
+        return None
+
+    @classmethod
+    def _parse_participants(cls, value: Any) -> List[str]:
+        parsed = cls._parse_json_or_literal(value)
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+        text = str(value or "").strip()
+        if not text:
+            return []
+        return [p.strip() for p in text.split(",") if p.strip()]
+
+    @classmethod
+    def _parse_shares(cls, value: Any) -> Dict[str, float]:
+        parsed = cls._parse_json_or_literal(value)
+        if not isinstance(parsed, dict):
+            return {}
+        out: Dict[str, float] = {}
+        for k, v in parsed.items():
+            name = str(k).strip()
+            if not name:
+                continue
+            amt = cls._to_float(v, 0.0)
+            out[name] = round(amt, 2)
+        return out
+
+    @classmethod
+    def _parse_categories(cls, value: Any) -> List[str]:
+        parsed = cls._parse_json_or_literal(value)
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+        text = str(value or "").strip()
+        if not text:
+            return []
+        return [p.strip() for p in text.split(",") if p.strip()]
+
+    @classmethod
+    def _record_to_expense_dict(cls, record: Dict[str, Any]) -> Dict[str, Any]:
+        shares_raw = record.get("shares_json", record.get("shares", ""))
+        unit = str(record.get("unit", "")).strip() or "EUR"
+        return {
+            "id": cls._to_int(record.get("id", 0), 0),
+            "amount": round(cls._to_float(record.get("amount", 0.0), 0.0), 2),
+            "payer": str(record.get("payer", "")).strip(),
+            "participants": cls._parse_participants(record.get("participants", "")),
+            "category": str(record.get("category", "")).strip(),
+            "description": str(record.get("description", "")).strip(),
+            "unit": unit,
+            "shares": cls._parse_shares(shares_raw),
+            "date": str(record.get("date", "")).strip(),
+        }
+
+    def save_state(self, data: Dict[str, Any]) -> bool:
+        if not self.available:
+            return False
+
+        try:
+            self._ensure_headers()
+            expenses = list(data.get("expenses", []) or [])
+            categories = list(data.get("categories", []) or [])
+            next_id = max(1, self._to_int(data.get("next_id", len(expenses) + 1), len(expenses) + 1))
+
+            expense_rows = [self.EXPENSE_HEADERS]
+            for e in expenses:
+                participants_json = json.dumps(e.get("participants", []) or [], ensure_ascii=False)
+                shares_json = json.dumps(e.get("shares", {}) or {}, ensure_ascii=False)
+                expense_rows.append(
+                    [
+                        str(self._to_int(e.get("id", 0), 0)),
+                        f"{round(self._to_float(e.get('amount', 0.0), 0.0), 2):.2f}",
+                        str(e.get("payer", "") or ""),
+                        participants_json,
+                        str(e.get("category", "") or ""),
+                        str(e.get("description", "") or ""),
+                        str(e.get("unit", "EUR") or "EUR"),
+                        shares_json,
+                        str(e.get("date", "") or ""),
+                    ]
+                )
+
+            meta_rows = [
+                self.META_HEADERS,
+                ["next_id", str(next_id)],
+                ["categories", json.dumps(categories, ensure_ascii=False)],
+            ]
+
+            self._ensure_sheet_size(self._expenses_ws, len(expense_rows) + 10, len(self.EXPENSE_HEADERS))
+            self._ensure_sheet_size(self._meta_ws, len(meta_rows) + 5, len(self.META_HEADERS))
+
+            # Use RAW to store user content as plain values (not spreadsheet formulas).
+            self._expenses_ws.clear()
+            self._expenses_ws.update(
+                range_name="A1",
+                values=expense_rows,
+                value_input_option="RAW",
+            )
+
+            self._meta_ws.clear()
+            self._meta_ws.update(
+                range_name="A1",
+                values=meta_rows,
+                value_input_option="RAW",
+            )
+            return True
+        except Exception:
+            logger.exception("Failed to save tracker state to Google Sheets")
+            return False
+
+    def load_state(self) -> Dict[str, Any]:
+        if not self.available:
+            return {}
+
+        try:
+            self._ensure_headers()
+
+            expenses: List[Dict[str, Any]] = []
+            exp_values = self._expenses_ws.get_all_values() or []
+            if exp_values:
+                raw_headers = exp_values[0]
+                headers = [str(h).strip().lower() for h in raw_headers]
+                for row in exp_values[1:]:
+                    if not any(str(c).strip() for c in row):
+                        continue
+                    record: Dict[str, Any] = {}
+                    for idx, header in enumerate(headers):
+                        if not header:
+                            continue
+                        record[header] = row[idx] if idx < len(row) else ""
+                    if not any(record.values()):
+                        continue
+                    expenses.append(self._record_to_expense_dict(record))
+
+            meta_map: Dict[str, str] = {}
+            meta_values = self._meta_ws.get_all_values() or []
+            for row in meta_values[1:]:
+                if not row:
+                    continue
+                key = str(row[0]).strip() if len(row) > 0 else ""
+                value = str(row[1]).strip() if len(row) > 1 else ""
+                if key:
+                    meta_map[key] = value
+
+            next_id = self._to_int(meta_map.get("next_id", ""), len(expenses) + 1)
+            categories = self._parse_categories(meta_map.get("categories", ""))
+            return {
+                "next_id": max(1, next_id),
+                "expenses": expenses,
+                "categories": categories,
+            }
+        except Exception:
+            logger.exception("Failed to load tracker state from Google Sheets")
+            return {}
+
+
 class ExpenseTracker:
     """
     Single-instance style tracker object. The UI creates one ExpenseTracker()
@@ -84,9 +375,8 @@ class ExpenseTracker:
         self.categories: List[str] = list(DEFAULT_CATEGORIES)
         # next id for new expenses
         self._next_id = 1
-        # load persisted state (if any)
-        # initialize Google Sheets backend (if configured)
-        self._gs_backend = GoogleSheetsBackend() if "GoogleSheetsBackend" in globals() else None
+        # initialize Google Sheets backend if configured
+        self._gs_backend = GoogleSheetsBackend()
         # When running tests, ensure we start from a clean state by removing
         # any temp data file left from previous test runs.
         if any("pytest" in p for p in sys.argv) or os.getenv("PYTEST_CURRENT_TEST"):
@@ -96,6 +386,19 @@ class ExpenseTracker:
             except Exception:
                 pass
         self.load()
+
+    def uses_google_sheets(self) -> bool:
+        """True when the durable Google Sheets backend is active."""
+        return bool(getattr(self, "_gs_backend", None) and self._gs_backend.available)
+
+    def storage_status(self) -> Tuple[str, str]:
+        """
+        Return current storage backend and a short diagnostic message for the UI.
+        """
+        if self.uses_google_sheets():
+            return "google_sheets", "Persistent storage active (Google Sheets)."
+        reason = getattr(self._gs_backend, "reason", "Google Sheets not configured")
+        return "local_json", f"Using local file fallback: {reason}."
 
     def add_expense(
         self,
@@ -113,6 +416,9 @@ class ExpenseTracker:
         shares: optional per-participant amounts (used for custom split).
         date: ISO string "YYYY-MM-DD" (UI ensures valid date).
         """
+        # Refresh from remote before mutating to reduce stale-session overwrites.
+        if self.uses_google_sheets():
+            self.load()
         if shares is None:
             shares = {}
         exp = Expense(
@@ -140,6 +446,8 @@ class ExpenseTracker:
         Persist a new category if it doesn't already exist.
         Returns True when a new category was added, False otherwise.
         """
+        if self.uses_google_sheets():
+            self.load()
         name = (name or "").strip()
         if not name:
             return False
@@ -231,10 +539,9 @@ class ExpenseTracker:
 
     def load(self):
         """
-        Load tracker state from JSON. If the file does not exist, nothing is loaded
-        and defaults remain (empty expenses, default categories).
-        After loading we reindex expenses sequentially and update _next_id so
-        numbering is always contiguous (1..n).
+        Load tracker state from Google Sheets when configured, otherwise local JSON.
+        If no saved data exists, defaults remain (empty expenses, default categories).
+        IDs are kept stable; _next_id is set to at least max(existing_id) + 1.
         """
         # Try Google Sheets backend first
         try:
@@ -253,13 +560,26 @@ class ExpenseTracker:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-        # build Expense objects from data
+        # build Expense objects from data and normalize malformed ids.
         self.expenses = [Expense.from_dict(d) for d in data.get("expenses", [])]
-        # reindex sequential ids to ensure consistent numbering
-        for idx, exp in enumerate(self.expenses, start=1):
-            exp.id = idx
-        # set next id to len + 1 (so next add continues sequence)
-        self._next_id = int(data.get("next_id", len(self.expenses) + 1))
+        max_id = 0
+        for exp in self.expenses:
+            try:
+                exp_id = int(exp.id)
+            except Exception:
+                exp_id = 0
+            if exp_id <= 0:
+                max_id += 1
+                exp.id = max_id
+            else:
+                max_id = max(max_id, exp_id)
+
+        # Keep ids stable across reloads/deletes; next id should always exceed max existing id.
+        try:
+            next_id_raw = int(data.get("next_id", max_id + 1))
+        except Exception:
+            next_id_raw = max_id + 1
+        self._next_id = max(next_id_raw, max_id + 1)
         # restore categories: ensure DEFAULT_CATEGORIES are present (prepend defaults)
         loaded_cats = data.get("categories", []) or []
         merged = []
@@ -409,6 +729,8 @@ class ExpenseTracker:
         amount, payer, participants, category, description, unit, shares, date.
         Returns the updated Expense or None if id not found.
         """
+        if self.uses_google_sheets():
+            self.load()
         for e in self.expenses:
             if e.id == expense_id:
                 for key in ("amount", "payer", "participants", "category", "description", "unit", "shares", "date"):
@@ -431,9 +753,10 @@ class ExpenseTracker:
     def delete_expense(self, expense_id: int) -> bool:
         """Remove expense by id. Returns True if deleted, False if not found.
 
-        After removing the expense, reassign sequential ids to remaining expenses
-        (1..n) and update self._next_id so new expenses continue numbering.
+        IDs are not renumbered, to keep references stable across sessions.
         """
+        if self.uses_google_sheets():
+            self.load()
         try:
             # coerce types to int for reliable comparison
             target_id = int(expense_id)
@@ -453,24 +776,31 @@ class ExpenseTracker:
                     continue
             if e_id == target_id:
                 removed = self.expenses.pop(i)
-                # Re-number remaining expenses sequentially starting at 1
-                for idx, exp in enumerate(self.expenses, start=1):
-                    exp.id = idx
-                # Set next id to len + 1
-                self._next_id = len(self.expenses) + 1
+                # Keep next id monotonic to avoid id reuse.
+                max_existing = 0
+                for exp in self.expenses:
+                    try:
+                        max_existing = max(max_existing, int(exp.id))
+                    except Exception:
+                        continue
+                self._next_id = max(self._next_id, max_existing + 1)
                 try:
                     # persist changes
                     self.save()
-                    logger.info("Deleted expense id=%s (category=%s, amount=%s). Reindexed %d expenses.",
+                    logger.info("Deleted expense id=%s (category=%s, amount=%s). Remaining expenses=%d.",
                                 target_id, getattr(removed, "category", ""), getattr(removed, "amount", ""), len(self.expenses))
                     return True
                 except Exception:
                     logger.exception("Error saving after delete")
-                    # restore in-memory list if save failed and restore previous ids
+                    # restore in-memory list if save failed
                     self.expenses.insert(i, removed)
-                    for idx, exp in enumerate(self.expenses, start=1):
-                        exp.id = idx
-                    self._next_id = len(self.expenses) + 1
+                    max_existing = 0
+                    for exp in self.expenses:
+                        try:
+                            max_existing = max(max_existing, int(exp.id))
+                        except Exception:
+                            continue
+                    self._next_id = max(self._next_id, max_existing + 1)
                     return False
         logger.info("Expense id=%s not found", target_id)
         return False
