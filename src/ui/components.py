@@ -278,12 +278,15 @@ def display_expense_list(
 
 def display_balances(
     yearly_balances_by_unit: Dict[int, Dict[str, Dict[str, float]]],
-    yearly_suggestions_chf: Dict[int, List[str]],
-    fx_snapshot: Optional[Dict[str, Any]] = None,
-    yearly_skipped_units: Optional[Dict[int, Dict[str, float]]] = None,
+    overall_settle_sentence_chf: Optional[str] = None,
 ):
-    """Show per-year balances grouped per currency, with CHF settle suggestions."""
-    st.header("Balances")
+    """Show per-year balances in favor, with a single CHF settle sentence."""
+    st.header("Balances in favour")
+    if overall_settle_sentence_chf:
+        st.write(overall_settle_sentence_chf)
+    else:
+        st.write("Nothing to settle in CHF.")
+
     if not yearly_balances_by_unit:
         st.write("No balances to display.")
         return
@@ -299,39 +302,12 @@ def display_balances(
             balances = unit_balances[unit]
             st.markdown(f"**{unit}**")
             in_favor = sorted([(p, a) for p, a in balances.items() if a > 0], key=lambda x: x[1], reverse=True)
-            against = sorted([(p, -a) for p, a in balances.items() if a < 0], key=lambda x: x[1], reverse=True)
-
             if in_favor:
-                st.write("In favor:")
-                for name, amount in in_favor:
-                    st.write(f"  {name}: +{amount:.2f} {unit}")
+                # Show only the top positive balance for each year/currency.
+                name, amount = in_favor[0]
+                st.write(f"{name}: +{amount:.2f} {unit}")
             else:
-                st.write("In favor: none")
-
-            if against:
-                st.write("Against:")
-                for name, amount in against:
-                    st.write(f"  {name}: -{amount:.2f} {unit}")
-            else:
-                st.write("Against: none")
-
-        suggestions = yearly_suggestions_chf.get(year, []) or []
-        if fx_snapshot and suggestions:
-            source = str(fx_snapshot.get("source", "FX provider"))
-            as_of = str(fx_snapshot.get("as_of", "") or "")
-            if as_of:
-                st.caption(f"Converted using {source} rates as of {as_of}")
-            else:
-                st.caption(f"Converted using {source}")
-        if suggestions:
-            for s in suggestions:
-                st.write(s)
-        else:
-            st.write("Nothing to settle in CHF.")
-
-        if yearly_skipped_units:
-            skipped = yearly_skipped_units.get(year, {})
-            _show_skipped_units(skipped)
+                st.write("No positive balance.")
         st.markdown("---")
 
 def display_expenses_over_time(
@@ -418,7 +394,7 @@ def display_expenses_over_time(
                 alt.Tooltip("category:N", title="Category"),
                 alt.Tooltip("amount:Q", title="Amount (CHF)", format=".2f"),
             ],
-        ).properties(width="container", height=300)
+        ).properties(width="container", height=600)
         st.altair_chart(chart, use_container_width=True)
         return
 
@@ -438,7 +414,7 @@ def display_expenses_over_time(
                 alt.Tooltip("category:N", title="Category"),
                 alt.Tooltip("amount:Q", title="Amount", format=".2f"),
             ],
-        ).properties(width="container", height=300)
+        ).properties(width="container", height=600)
         st.altair_chart(chart, use_container_width=True)
 
 def display_settle_suggestions(suggestions_by_unit: Dict[str, List[str]]):

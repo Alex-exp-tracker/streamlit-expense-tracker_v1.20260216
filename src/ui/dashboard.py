@@ -97,19 +97,15 @@ def main():
     elif choice == "Show Balances":
         years, _ = tracker.available_periods()
         yearly_balances = {}
-        yearly_suggestions_chf = {}
-        yearly_skipped_units = {}
         for year in years:
             year_expenses = tracker.list_expenses(year=year)
             yearly_balances[year] = tracker.balances_for_expenses(year_expenses)
-            yearly_suggestions_chf[year] = tracker.settle_suggestions_chf_for_expenses(year_expenses, rates=fx_rates)
-            _, skipped = tracker.grand_total_chf(expenses=year_expenses, rates=fx_rates)
-            yearly_skipped_units[year] = skipped
+
+        overall_suggestions = tracker.settle_suggestions_chf(rates=fx_rates)
+        overall_settle_sentence_chf = overall_suggestions[0] if overall_suggestions else None
         components.display_balances(
             yearly_balances,
-            yearly_suggestions_chf=yearly_suggestions_chf,
-            fx_snapshot=fx_snapshot,
-            yearly_skipped_units=yearly_skipped_units,
+            overall_settle_sentence_chf=overall_settle_sentence_chf,
         )
 
     elif choice == "Category Totals":
