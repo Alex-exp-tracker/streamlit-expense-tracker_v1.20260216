@@ -100,6 +100,8 @@ def display_expense_form(on_submit: Callable[[ExpenseInput], None],
 
         # Date input: required for filtering (stored as ISO string)
         date_val = st.date_input("Date", value=datetime.date.today())
+        # Optional free-text note for informational context in the expense list.
+        description = st.text_input("Expense description (optional)")
 
         # Split mode: equal or custom shares
         split_mode = st.radio("Split mode", options=["Equal split", "Custom shares"])
@@ -170,7 +172,7 @@ def display_expense_form(on_submit: Callable[[ExpenseInput], None],
                 payer=payer,
                 participants=participants_list,
                 category=category_final,
-                description="",
+                description=description.strip(),
                 unit=unit,
                 shares=shares,
                 date=date_iso,
