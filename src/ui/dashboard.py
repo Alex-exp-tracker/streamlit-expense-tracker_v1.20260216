@@ -14,32 +14,7 @@ Design notes:
 import streamlit as st
 from src.tracker import ExpenseTracker
 from src.ui import components
-from typing import Dict, List
 import datetime
-
-
-def display_expenses(expenses):
-    """
-    Small wrapper used by the dashboard when viewing the List Expenses screen.
-    Delegates rendering to components.display_expense_list for consistent formatting.
-    """
-    components.display_expense_list(expenses)
-
-
-def display_balances(balances_by_unit: Dict[str, Dict[str, float]]):
-    """Wrapper to render balances using the components helper."""
-    components.display_balances(balances_by_unit)
-
-
-def display_settle_suggestions(suggestions_by_unit: Dict[str, List[str]]):
-    """Wrapper to render settle suggestions using the components helper."""
-    components.display_settle_suggestions(suggestions_by_unit)
-
-
-def display_category_totals(totals_by_unit: Dict[str, Dict[str, float]]):
-    """Wrapper to render category totals using the components helper."""
-    components.display_category_totals(totals_by_unit)
-
 
 def main():
     """
@@ -47,8 +22,7 @@ def main():
     Actions:
       - Add Expense: show form and persist via tracker.add_expense
       - List Expenses: optional year/month filters
-      - Show Balances: grouped by currency unit
-      - Show Settle Suggestions: per currency
+      - Show Balances: per-year balances by currency, with CHF settle suggestions
       - Category Totals: aggregate by selected month or year
       - Clear All Expenses: reset data (with single-button confirmation)
     """
@@ -77,7 +51,7 @@ def main():
     if fx_snapshot.get("stale"):
         st.sidebar.caption("FX rates may be stale.")
 
-    menu = ["Add Expense", "List Expenses", "Show Balances", "Show Settle Suggestions", "Category Totals", "Expenses over time", "Edit Expense", "Clear All Expenses"]
+    menu = ["Add Expense", "List Expenses", "Show Balances", "Category Totals", "Expenses over time", "Edit Expense", "Clear All Expenses"]
     choice = st.sidebar.selectbox("Select an option", menu)
 
     if choice == "Add Expense":
@@ -121,25 +95,21 @@ def main():
         )
 
     elif choice == "Show Balances":
-        balances_by_unit = tracker.balances()
-        all_expenses = tracker.list_expenses()
-        grand_total_chf, skipped_units = tracker.grand_total_chf(expenses=all_expenses, rates=fx_rates)
+        years, _ = tracker.available_periods()
+        yearly_balances = {}
+        yearly_suggestions_chf = {}
+        yearly_skipped_units = {}
+        for year in years:
+            year_expenses = tracker.list_expenses(year=year)
+            yearly_balances[year] = tracker.balances_for_expenses(year_expenses)
+            yearly_suggestions_chf[year] = tracker.settle_suggestions_chf_for_expenses(year_expenses, rates=fx_rates)
+            _, skipped = tracker.grand_total_chf(expenses=year_expenses, rates=fx_rates)
+            yearly_skipped_units[year] = skipped
         components.display_balances(
-            balances_by_unit,
-            grand_total_chf=grand_total_chf,
+            yearly_balances,
+            yearly_suggestions_chf=yearly_suggestions_chf,
             fx_snapshot=fx_snapshot,
-            skipped_units=skipped_units,
-        )
-
-    elif choice == "Show Settle Suggestions":
-        all_expenses = tracker.list_expenses()
-        suggestions_chf = tracker.settle_suggestions_chf(rates=fx_rates)
-        grand_total_chf, skipped_units = tracker.grand_total_chf(expenses=all_expenses, rates=fx_rates)
-        components.display_settle_suggestions_chf(
-            suggestions_chf,
-            grand_total_chf=grand_total_chf,
-            fx_snapshot=fx_snapshot,
-            skipped_units=skipped_units,
+            yearly_skipped_units=yearly_skipped_units,
         )
 
     elif choice == "Category Totals":
@@ -175,13 +145,52 @@ def main():
 
     elif choice == "Expenses over time":
         exs = tracker.list_expenses()
-        grand_total_chf, skipped_units = tracker.grand_total_chf(expenses=exs, rates=fx_rates)
+        grand_total_chf, all_skipped_units = tracker.grand_total_chf(expenses=exs, rates=fx_rates)
+        filtered_exs = exs
+        total_for_period_chf = None
+        skipped_units_for_view = all_skipped_units
+
+        month_values = set()
+        for e in exs:
+            try:
+                d = datetime.date.fromisoformat(getattr(e, "date", ""))
+            except Exception:
+                continue
+            month_values.add(datetime.date(d.year, d.month, 1))
+        month_values = sorted(month_values)
+
+        if month_values:
+            use_month_range = st.checkbox("Filter by month range", value=False)
+            if use_month_range:
+                month_labels = [m.strftime("%Y-%m") for m in month_values]
+                start_label = st.selectbox("Start month", options=month_labels, index=0)
+                end_label = st.selectbox("End month", options=month_labels, index=len(month_labels) - 1)
+                start_month = month_values[month_labels.index(start_label)]
+                end_month = month_values[month_labels.index(end_label)]
+                if start_month > end_month:
+                    start_month, end_month = end_month, start_month
+
+                filtered_exs = []
+                for e in exs:
+                    try:
+                        d = datetime.date.fromisoformat(getattr(e, "date", ""))
+                    except Exception:
+                        continue
+                    dm = datetime.date(d.year, d.month, 1)
+                    if start_month <= dm <= end_month:
+                        filtered_exs.append(e)
+                total_for_period_chf, skipped_units_for_view = tracker.grand_total_chf(
+                    expenses=filtered_exs,
+                    rates=fx_rates,
+                )
+
         components.display_expenses_over_time(
-            exs,
+            filtered_exs,
             chf_rates=fx_rates,
             grand_total_chf=grand_total_chf,
+            total_for_period_chf=total_for_period_chf,
             fx_snapshot=fx_snapshot,
-            skipped_units=skipped_units,
+            skipped_units=skipped_units_for_view,
         )
 
     elif choice == "Edit Expense":

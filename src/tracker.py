@@ -46,6 +46,8 @@ DEFAULT_CATEGORIES = [
     "Groceries",
     "MiniM",
     "Electricity & Water",
+    "Health & Insurance",
+    "Insurances",
     "Eating out",
     "Fuel",
     "Home",
@@ -60,9 +62,9 @@ DEFAULT_CATEGORIES = [
     "Airfares",
     "Hotels - Holidays",
     "Fuel - Holidays",
-    "Culture & Entertainment - Hol.",
     "Transport - Holidays",
 ]
+DEPRECATED_CATEGORIES = {"Culture & Entertainment - Hol."}
 
 # ensure a logger is available
 logger = logging.getLogger(__name__)
@@ -530,10 +532,21 @@ class ExpenseTracker:
         Combine per-currency balances into a single CHF balance per participant.
         Unsupported currencies are ignored.
         """
+        return self.balances_chf_for_expenses(self.expenses, rates=rates)
+
+    def balances_chf_for_expenses(
+        self,
+        expenses: List[Expense],
+        rates: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, float]:
+        """
+        Combine per-currency balances into CHF for a given expense subset.
+        Unsupported currencies are ignored.
+        """
         if rates is None:
             rates = self.get_fx_snapshot().get("rates", {"CHF": 1.0})
 
-        balances_by_unit = self.balances()
+        balances_by_unit = self._balances_from_expenses(expenses)
         out: Dict[str, float] = {}
         for unit, unit_balances in balances_by_unit.items():
             unit_norm = self._normalize_unit(unit)
@@ -555,7 +568,17 @@ class ExpenseTracker:
         """
         Produce settle-up suggestions on combined CHF balances.
         """
-        balances = self.balances_chf(rates=rates)
+        return self.settle_suggestions_chf_for_expenses(self.expenses, rates=rates)
+
+    def settle_suggestions_chf_for_expenses(
+        self,
+        expenses: List[Expense],
+        rates: Optional[Dict[str, float]] = None,
+    ) -> List[str]:
+        """
+        Produce settle-up suggestions in CHF for a given expense subset.
+        """
+        balances = self.balances_chf_for_expenses(expenses, rates=rates)
         creditors = [(p, amt) for p, amt in balances.items() if amt > 0]
         debtors = [(p, -amt) for p, amt in balances.items() if amt < 0]
         creditors.sort(key=lambda x: x[1], reverse=True)
@@ -664,7 +687,7 @@ class ExpenseTracker:
 
     def get_categories(self) -> List[str]:
         """Return a copy of the category list used to populate dropdowns in the UI."""
-        return list(self.categories)
+        return [c for c in self.categories if c not in DEPRECATED_CATEGORIES]
 
     def add_category(self, name: str) -> bool:
         """
@@ -675,6 +698,8 @@ class ExpenseTracker:
             self.load()
         name = (name or "").strip()
         if not name:
+            return False
+        if name in DEPRECATED_CATEGORIES:
             return False
         if name in self.categories:
             return False
@@ -806,7 +831,7 @@ class ExpenseTracker:
             next_id_raw = max_id + 1
         self._next_id = max(next_id_raw, max_id + 1)
         # restore categories: ensure DEFAULT_CATEGORIES are present (prepend defaults)
-        loaded_cats = data.get("categories", []) or []
+        loaded_cats = [c for c in (data.get("categories", []) or []) if c not in DEPRECATED_CATEGORIES]
         merged = []
         for c in DEFAULT_CATEGORIES:
             if c in loaded_cats:
@@ -818,7 +843,7 @@ class ExpenseTracker:
         # if no categories were loaded, fall back to defaults
         self.categories = merged or list(DEFAULT_CATEGORIES)
 
-    def balances(self) -> Dict[str, Dict[str, float]]:
+    def _balances_from_expenses(self, expenses: List[Expense]) -> Dict[str, Dict[str, float]]:
         """
         Compute net balances grouped per currency/unit.
 
@@ -834,7 +859,7 @@ class ExpenseTracker:
             - Negative balance => participant owes money.
         """
         result: Dict[str, Dict[str, float]] = {}
-        for e in self.expenses:
+        for e in expenses:
             unit = getattr(e, "unit", "EUR") or "EUR"
             bal = result.setdefault(unit, {})
             if e.shares:
@@ -863,7 +888,15 @@ class ExpenseTracker:
                     balances[p] = round(v, 2)
         return result
 
-    def settle_suggestions(self) -> Dict[str, List[str]]:
+    def balances(self) -> Dict[str, Dict[str, float]]:
+        return self._balances_from_expenses(self.expenses)
+
+    def balances_for_expenses(self, expenses: List[Expense]) -> Dict[str, Dict[str, float]]:
+        """Public helper to compute balances for a provided expense subset."""
+        return self._balances_from_expenses(expenses)
+
+    @staticmethod
+    def _settle_suggestions_from_balances(balances_by_unit: Dict[str, Dict[str, float]]) -> Dict[str, List[str]]:
         """
         Produce settle-up suggestions per currency.
 
@@ -873,7 +906,6 @@ class ExpenseTracker:
           - Produce strings like "Morgan pays Alessio 12.34 EUR"
         """
         suggestions_by_unit: Dict[str, List[str]] = {}
-        balances_by_unit = self.balances()
         for unit, bal in balances_by_unit.items():
             creditors = [(p, amt) for p, amt in bal.items() if amt > 0]
             debtors = [(p, -amt) for p, amt in bal.items() if amt < 0]  # store positive owed for debtors
@@ -898,6 +930,9 @@ class ExpenseTracker:
                     creditors[j] = (c_name, c_amt)
             suggestions_by_unit[unit] = suggestions
         return suggestions_by_unit
+
+    def settle_suggestions(self) -> Dict[str, List[str]]:
+        return self._settle_suggestions_from_balances(self.balances())
 
     def available_periods(self) -> Tuple[List[int], Dict[int, List[int]]]:
         """

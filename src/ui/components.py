@@ -247,6 +247,7 @@ def display_expense_list(
         })
 
     df = pd.DataFrame(rows, columns=["id", "date", "category", "amount", "unit", "payer", "participants", "description", "shares_json"])
+    df = df.sort_values(by="id", ascending=False).reset_index(drop=True)
 
     # Display as interactive table
     st.dataframe(df.style.format({"amount": "{:.2f}"}), use_container_width=True)
@@ -276,30 +277,68 @@ def display_expense_list(
 
 
 def display_balances(
-    balances_by_unit: Dict[str, Dict[str, float]],
-    grand_total_chf: Optional[float] = None,
+    yearly_balances_by_unit: Dict[int, Dict[str, Dict[str, float]]],
+    yearly_suggestions_chf: Dict[int, List[str]],
     fx_snapshot: Optional[Dict[str, Any]] = None,
-    skipped_units: Optional[Dict[str, float]] = None,
+    yearly_skipped_units: Optional[Dict[int, Dict[str, float]]] = None,
 ):
-    """Show balances grouped per currency unit."""
+    """Show per-year balances grouped per currency, with CHF settle suggestions."""
     st.header("Balances")
-    _show_grand_total_chf(grand_total_chf, fx_snapshot=fx_snapshot)
-    _show_skipped_units(skipped_units)
-    if balances_by_unit:
-        for unit, balances in balances_by_unit.items():
-            st.markdown(f"**{unit}**")
-            if not balances:
-                st.write("  No entries.")
-                continue
-            for participant, balance in balances.items():
-                st.write(f"  {participant}: {balance:.2f} {unit}")
-    else:
+    if not yearly_balances_by_unit:
         st.write("No balances to display.")
+        return
+
+    for year in sorted(yearly_balances_by_unit.keys(), reverse=True):
+        st.subheader(str(year))
+        unit_balances = yearly_balances_by_unit.get(year, {}) or {}
+        if not unit_balances:
+            st.write("No balances for this year.")
+            continue
+
+        for unit in sorted(unit_balances.keys()):
+            balances = unit_balances[unit]
+            st.markdown(f"**{unit}**")
+            in_favor = sorted([(p, a) for p, a in balances.items() if a > 0], key=lambda x: x[1], reverse=True)
+            against = sorted([(p, -a) for p, a in balances.items() if a < 0], key=lambda x: x[1], reverse=True)
+
+            if in_favor:
+                st.write("In favor:")
+                for name, amount in in_favor:
+                    st.write(f"  {name}: +{amount:.2f} {unit}")
+            else:
+                st.write("In favor: none")
+
+            if against:
+                st.write("Against:")
+                for name, amount in against:
+                    st.write(f"  {name}: -{amount:.2f} {unit}")
+            else:
+                st.write("Against: none")
+
+        suggestions = yearly_suggestions_chf.get(year, []) or []
+        if fx_snapshot and suggestions:
+            source = str(fx_snapshot.get("source", "FX provider"))
+            as_of = str(fx_snapshot.get("as_of", "") or "")
+            if as_of:
+                st.caption(f"Converted using {source} rates as of {as_of}")
+            else:
+                st.caption(f"Converted using {source}")
+        if suggestions:
+            for s in suggestions:
+                st.write(s)
+        else:
+            st.write("Nothing to settle in CHF.")
+
+        if yearly_skipped_units:
+            skipped = yearly_skipped_units.get(year, {})
+            _show_skipped_units(skipped)
+        st.markdown("---")
 
 def display_expenses_over_time(
     expenses: List[Expense],
     chf_rates: Optional[Dict[str, float]] = None,
     grand_total_chf: Optional[float] = None,
+    total_for_period_chf: Optional[float] = None,
     fx_snapshot: Optional[Dict[str, Any]] = None,
     skipped_units: Optional[Dict[str, float]] = None,
 ):
@@ -312,6 +351,8 @@ def display_expenses_over_time(
         st.write("No expenses recorded.")
         return
     _show_grand_total_chf(grand_total_chf, fx_snapshot=fx_snapshot)
+    if total_for_period_chf is not None:
+        st.markdown(f"**Total for Period: {total_for_period_chf:.2f} CHF**")
     _show_skipped_units(skipped_units)
 
     # Build DataFrame with a month-start datetime column.
@@ -535,7 +576,6 @@ def display_category_totals_chf(
     for cat, amt in totals_chf.items():
         amt_f = float(amt)
         pct = (amt_f / total_amount * 100) if total_amount > 0 else 0.0
-        st.write(f"  {cat}: {amt_f:.2f} CHF ({pct:.1f}%)")
         rows.append({"category": cat, "amount": amt_f, "percent": pct})
 
     df = pd.DataFrame(rows)
@@ -575,6 +615,10 @@ def display_category_totals_chf(
         ],
     ).properties(title="Category share (CHF)")
     st.altair_chart(pie, use_container_width=True)
+
+    # Show lines sorted by highest contribution first.
+    for _, row in df.sort_values(by="percent", ascending=False).iterrows():
+        st.write(f"  {row['category']}: {row['amount']:.2f} CHF ({row['percent']:.1f}%)")
 
 
 def display_manage_expenses(tracker):
