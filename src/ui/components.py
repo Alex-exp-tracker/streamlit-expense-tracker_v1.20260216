@@ -102,8 +102,14 @@ def display_expense_form(on_submit: Callable[[ExpenseInput], None],
     # Use a Streamlit form so the whole payload is submitted at once
     with st.form(key="expense_form"):
         # Basic fields
-        amount = st.number_input("Amount", min_value=0.0, format="%.2f")
-        unit = st.selectbox("Unit / Currency", options=["EUR", "USD", "GBP", "CHF", "other"])
+        amount = st.number_input(
+            "Amount",
+            min_value=0.0,
+            value=None,
+            format="%.2f",
+            placeholder="Enter amount",
+        )
+        unit = st.selectbox("Unit / Currency", options=["EUR", "USD", "GBP", "CHF", "other"], index=3)
         # Payer restricted to the two household members (UI enforces allowed values)
         payer = st.selectbox("Payer Name", options=["Alessio", "Morgan"])
         # Participants chosen from the same two names; default both selected
@@ -142,7 +148,7 @@ def display_expense_form(on_submit: Callable[[ExpenseInput], None],
         if submit_button:
             # Basic validation logic before constructing ExpenseInput
             participants_list = [p for p in participants]
-            if amount <= 0:
+            if amount is None or amount <= 0:
                 st.error("Amount must be greater than 0.")
                 return
             if not payer.strip():
@@ -317,12 +323,13 @@ def display_expenses_over_time(
     total_for_period_chf: Optional[float] = None,
     fx_snapshot: Optional[Dict[str, Any]] = None,
     skipped_units: Optional[Dict[str, float]] = None,
+    chart_title: str = "Expenses over time",
 ):
     """Show stacked monthly bars of expenses over time.
 
     When chf_rates is provided, amounts are converted and aggregated in CHF only.
     """
-    st.header("Expenses over time")
+    st.header(chart_title)
     if not expenses:
         st.write("No expenses recorded.")
         return

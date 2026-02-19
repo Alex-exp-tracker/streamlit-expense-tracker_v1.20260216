@@ -16,6 +16,61 @@ from src.tracker import ExpenseTracker
 from src.ui import components
 import datetime
 
+
+DEFAULT_TIMELINE_START = datetime.date(2025, 1, 1)
+
+
+def _month_start_from_expense(expense):
+    try:
+        d = datetime.date.fromisoformat(getattr(expense, "date", ""))
+    except Exception:
+        return None
+    return datetime.date(d.year, d.month, 1)
+
+
+def _default_month_range(month_values):
+    present_month = datetime.date.today().replace(day=1)
+    end_candidates = [m for m in month_values if m <= present_month]
+    default_end = end_candidates[-1] if end_candidates else month_values[-1]
+
+    start_candidates = [m for m in month_values if DEFAULT_TIMELINE_START <= m <= default_end]
+    default_start = start_candidates[0] if start_candidates else month_values[0]
+    return default_start, default_end
+
+
+def _select_month_range(month_values, start_key: str, end_key: str):
+    month_labels = [m.strftime("%Y-%m") for m in month_values]
+    default_start, default_end = _default_month_range(month_values)
+    start_label = st.selectbox(
+        "Start month",
+        options=month_labels,
+        index=month_values.index(default_start),
+        key=start_key,
+    )
+    end_label = st.selectbox(
+        "End month",
+        options=month_labels,
+        index=month_values.index(default_end),
+        key=end_key,
+    )
+    start_month = month_values[month_labels.index(start_label)]
+    end_month = month_values[month_labels.index(end_label)]
+    if start_month > end_month:
+        start_month, end_month = end_month, start_month
+    return start_month, end_month
+
+
+def _filter_expenses_by_month_range(expenses, start_month: datetime.date, end_month: datetime.date):
+    filtered = []
+    for e in expenses:
+        month_start = _month_start_from_expense(e)
+        if month_start is None:
+            continue
+        if start_month <= month_start <= end_month:
+            filtered.append(e)
+    return filtered
+
+
 def main():
     """
     Streamlit page: sidebar menu controls which view is shown.
@@ -51,7 +106,16 @@ def main():
     if fx_snapshot.get("stale"):
         st.sidebar.caption("FX rates may be stale.")
 
-    menu = ["Add Expense", "List Expenses", "Show Balances", "Category Totals", "Expenses over time", "Edit Expense", "Clear All Expenses"]
+    menu = [
+        "Add Expense",
+        "List Expenses",
+        "Show Balances",
+        "Category Totals",
+        "Expenses over time",
+        "Categories over time",
+        "Edit Expense",
+        "Clear All Expenses",
+    ]
     choice = st.sidebar.selectbox("Select an option", menu)
 
     if choice == "Add Expense":
@@ -146,39 +210,25 @@ def main():
         total_for_period_chf = None
         skipped_units_for_view = all_skipped_units
 
-        month_values = set()
-        for e in exs:
-            try:
-                d = datetime.date.fromisoformat(getattr(e, "date", ""))
-            except Exception:
-                continue
-            month_values.add(datetime.date(d.year, d.month, 1))
-        month_values = sorted(month_values)
+        month_values = sorted(
+            {
+                month_start
+                for month_start in (_month_start_from_expense(e) for e in exs)
+                if month_start is not None
+            }
+        )
 
         if month_values:
-            use_month_range = st.checkbox("Filter by month range", value=False)
-            if use_month_range:
-                month_labels = [m.strftime("%Y-%m") for m in month_values]
-                start_label = st.selectbox("Start month", options=month_labels, index=0)
-                end_label = st.selectbox("End month", options=month_labels, index=len(month_labels) - 1)
-                start_month = month_values[month_labels.index(start_label)]
-                end_month = month_values[month_labels.index(end_label)]
-                if start_month > end_month:
-                    start_month, end_month = end_month, start_month
-
-                filtered_exs = []
-                for e in exs:
-                    try:
-                        d = datetime.date.fromisoformat(getattr(e, "date", ""))
-                    except Exception:
-                        continue
-                    dm = datetime.date(d.year, d.month, 1)
-                    if start_month <= dm <= end_month:
-                        filtered_exs.append(e)
-                total_for_period_chf, skipped_units_for_view = tracker.grand_total_chf(
-                    expenses=filtered_exs,
-                    rates=fx_rates,
-                )
+            start_month, end_month = _select_month_range(
+                month_values,
+                start_key="expenses_over_time_start_month",
+                end_key="expenses_over_time_end_month",
+            )
+            filtered_exs = _filter_expenses_by_month_range(exs, start_month, end_month)
+            total_for_period_chf, skipped_units_for_view = tracker.grand_total_chf(
+                expenses=filtered_exs,
+                rates=fx_rates,
+            )
 
         components.display_expenses_over_time(
             filtered_exs,
@@ -188,6 +238,59 @@ def main():
             fx_snapshot=fx_snapshot,
             skipped_units=skipped_units_for_view,
         )
+
+    elif choice == "Categories over time":
+        exs = tracker.list_expenses()
+        categories = sorted(
+            {
+                str(getattr(e, "category", "")).strip()
+                for e in exs
+                if str(getattr(e, "category", "")).strip()
+            }
+        )
+        if not categories:
+            st.info("No expenses recorded yet.")
+        else:
+            selected_category = st.selectbox("Category", options=categories)
+            category_exs = [
+                e for e in exs if str(getattr(e, "category", "")).strip() == selected_category
+            ]
+            grand_total_chf, all_skipped_units = tracker.grand_total_chf(
+                expenses=category_exs,
+                rates=fx_rates,
+            )
+            filtered_exs = category_exs
+            total_for_period_chf = None
+            skipped_units_for_view = all_skipped_units
+
+            month_values = sorted(
+                {
+                    month_start
+                    for month_start in (_month_start_from_expense(e) for e in category_exs)
+                    if month_start is not None
+                }
+            )
+            if month_values:
+                start_month, end_month = _select_month_range(
+                    month_values,
+                    start_key="categories_over_time_start_month",
+                    end_key="categories_over_time_end_month",
+                )
+                filtered_exs = _filter_expenses_by_month_range(category_exs, start_month, end_month)
+                total_for_period_chf, skipped_units_for_view = tracker.grand_total_chf(
+                    expenses=filtered_exs,
+                    rates=fx_rates,
+                )
+
+            components.display_expenses_over_time(
+                filtered_exs,
+                chf_rates=fx_rates,
+                grand_total_chf=grand_total_chf,
+                total_for_period_chf=total_for_period_chf,
+                fx_snapshot=fx_snapshot,
+                skipped_units=skipped_units_for_view,
+                chart_title=f"Category over time: {selected_category}",
+            )
 
     elif choice == "Edit Expense":
         # New: show edit/delete UI
